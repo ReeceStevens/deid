@@ -2,9 +2,12 @@ __author__ = "Vanessa Sochat"
 __copyright__ = "Copyright 2016-2025, Vanessa Sochat"
 __license__ = "MIT"
 
+from collections import defaultdict
 import re
+from functools import cache
 
 from pydicom.dataelem import DataElement
+from pydicom import FileDataset
 from pydicom.dataset import Dataset, FileMetaDataset, RawDataElement
 from pydicom.sequence import Sequence
 
@@ -77,14 +80,26 @@ class DicomField:
         - PRIVATE_CREATOR: Private creator string in double quotes
         - ELEMENT_OFFSET: 2-digit hexadecimal element number (last 8 bits of full element)
         """
-        regexp_expression = f"^{expression}$" if whole_string else expression
+        if whole_string:
+            expr = expression.lower()
+            return (
+                self.name.lower() == expr
+                or f"({self.element.tag.group:04X},{self.element.tag.element:04X})".lower()
+                == expr
+                or self.stripped_tag.lower() == expr
+                or expr == self.element.name.lower()
+                or expr == self.element.keyword.lower()
+            )
+        regexp_expression = (
+            re.compile(f"^{expression}$") if whole_string else expression
+        )
         if (
-            re.search(regexp_expression, self.name.lower())
+            regexp_expression.search(self.name.lower())
             or f"({self.element.tag.group:04X},{self.element.tag.element:04X})".lower()
             == expression.lower()
-            or re.search(regexp_expression, self.stripped_tag)
-            or re.search(regexp_expression, self.element.name)
-            or re.search(regexp_expression, self.element.keyword)
+            or regexp_expression.search(self.stripped_tag)
+            or regexp_expression.search(self.element.name)
+            or regexp_expression.search(self.element.keyword)
         ):
             return True
 
@@ -212,7 +227,9 @@ def extract_sequence(sequence, prefix=None):
     return items
 
 
-def expand_field_expression(field, dicom, contenders=None):
+def expand_field_expression(
+    field, dicom, contenders=None, contender_lookup_tables=None
+):
     """
     Get a list of fields based on an expression.
 
@@ -232,7 +249,7 @@ def expand_field_expression(field, dicom, contenders=None):
 
     # if no contenders provided, use top level of dicom headers
     if contenders is None:
-        contenders = get_fields(dicom)
+        contenders, contender_lookup_tables = get_fields_with_lookup(dicom)
 
     # Case 1: field is an expander without an argument (e.g., no :)
     if field.lower() in expanders:
@@ -243,11 +260,14 @@ def expand_field_expression(field, dicom, contenders=None):
     # Case 2: The field is a specific field OR an expander with argument (A:B)
     fields = field.split(":", 1)
     if len(fields) == 1:
-        return {
-            uid: field
-            for uid, field in contenders.items()
-            if field.name_contains(fields[0], whole_string=True)
-        }
+        exact_match_contenders = (
+            contender_lookup_tables["name"][fields[0]]
+            + contender_lookup_tables["tag"][fields[0]]
+            + contender_lookup_tables["stripped_tag"][fields[0]]
+            + contender_lookup_tables["element_name"][fields[0]]
+            + contender_lookup_tables["element_keyword"][fields[0]]
+        )
+        return {field.uid: field for field in exact_match_contenders}
 
     # if we get down here, we have an expander and expression
     expander, expression = fields
@@ -260,15 +280,16 @@ def expand_field_expression(field, dicom, contenders=None):
     elif expander.lower() == "startswith":
         expression = "^(%s)" % expression
 
+    expr = re.compile(expression)
     # Loop through fields, all are strings STOPPED HERE NEED TO ADDRESS EMPTY NAME
     for uid, field in contenders.items():
         # Apply expander to string for name OR to tag string
         if expander.lower() in ["endswith", "startswith", "contains"]:
-            if field.name_contains(expression):
+            if field.name_contains(expr):
                 fields[uid] = field
 
         elif expander.lower() == "except":
-            if not field.name_contains(expression):
+            if not field.name_contains(expr):
                 fields[uid] = field
 
         elif expander.lower() == "select":
@@ -278,14 +299,67 @@ def expand_field_expression(field, dicom, contenders=None):
     return fields
 
 
+# NOTE: This hashing function is not perfect, but it's required
+# to enable caching. Note that adding a proxy class around this
+# decreases performance substantially.
+FileDataset.__hash__ = lambda self: hash(self.filename)
+
+
 def get_fields(dicom, skip=None, expand_sequences=True, seen=None):
     """Expand all dicom fields into a list.
 
     Each entry is a DicomField. If we find a sequence, we unwrap it and
     represent the location with the name (e.g., Sequence__Child)
     """
-    skip = skip or []
-    seen = seen or []
+    fields, new_seen, new_skip = get_fields_inner(
+        dicom,
+        skip=tuple(skip) if skip else None,
+        expand_sequences=expand_sequences,
+        seen=tuple(seen) if seen else None,
+    )
+    return fields
+
+
+def get_fields_with_lookup(dicom, skip=None, expand_sequences=True, seen=None):
+    """Expand all dicom fields into a list.
+
+    Each entry is a DicomField. If we find a sequence, we unwrap it and
+    represent the location with the name (e.g., Sequence__Child)
+    """
+    fields, new_seen, new_skip = get_fields_inner(
+        dicom,
+        skip=tuple(skip) if skip else None,
+        expand_sequences=expand_sequences,
+        seen=tuple(seen) if seen else None,
+    )
+    skip = new_skip
+    seen = new_seen
+    lookup_tables = {
+        "name": defaultdict(list),
+        "tag": defaultdict(list),
+        "stripped_tag": defaultdict(list),
+        "element_name": defaultdict(list),
+        "element_keyword": defaultdict(list),
+    }
+    for uid, field in fields.items():
+        if field.name:
+            lookup_tables["name"][field.name].append(field)
+        if field.tag:
+            lookup_tables["tag"][field.tag].append(field)
+        if field.stripped_tag:
+            lookup_tables["stripped_tag"][field.stripped_tag].append(field)
+        if field.element.name:
+            lookup_tables["element_name"][field.element.name].append(field)
+        if field.element.keyword:
+            lookup_tables["element_keyword"][field.element.keyword].append(field)
+
+    return fields, lookup_tables
+
+
+@cache
+def get_fields_inner(dicom, skip=None, expand_sequences=True, seen=None):
+    skip = list(skip) if skip else []
+    seen = list(seen) if seen else []
     fields = {}  # indexed by nested tag
 
     if not isinstance(skip, list):
@@ -357,4 +431,4 @@ def get_fields(dicom, skip=None, expand_sequences=True, seen=None):
                     "Unrecognized type %s in extract sequences, skipping." % type(item)
                 )
 
-    return fields
+    return fields, seen, skip
